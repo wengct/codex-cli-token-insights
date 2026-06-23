@@ -1,0 +1,6 @@
+模型名稱,部署類型,單位,輸入價格(美金),快取輸入價格(美金),輸出價格(美金),批次 API 價格(美金)
+GPT-5.5,Global,1M Tokens,5,0.50,30,N/A
+GPT-5.4 (<272k),Global,1M Tokens,2.50,0.25,15,N/A
+GPT-5.4 (>272k),Global,1M Tokens,5,0.50,22.50,1.25/0.13/7.50
+GPT-5.4-mini,Global,1M Tokens,0.75,0.08,4.50,N/A
+GPT-5.3-Codex,Global,1M Tokens,1.75,0.18,14,N/A
