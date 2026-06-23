@@ -122,6 +122,15 @@ struct TokenStats {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+struct TokenCountUsage {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct ContextStats {
     current_context_tokens: Option<u64>,
     displayed_context_limit: Option<u64>,
@@ -673,42 +682,7 @@ async fn get_session_details(Path(session_id): Path<String>) -> impl IntoRespons
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("開啟檔案失敗: {}", e) }))).into_response(),
     };
 
-    // 從資料庫加載該 Session 每回合的 Token 增量 (delta_tokens) 統計
-    let session_id_clone = session_id.clone();
-    let db_entries: HashMap<u32, TokenStats> = tokio::task::spawn_blocking(move || {
-        let mut map = HashMap::new();
-        if let Ok(conn) = db::get_db_conn() {
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total 
-                 FROM usage_entries WHERE session_id = ? ORDER BY turn_no ASC"
-            ) {
-                if let Ok(mut rows) = stmt.query(params![session_id_clone]) {
-                    while let Ok(Some(row)) = rows.next() {
-                        if let (Ok(turn_no), Ok(delta_input), Ok(delta_output), Ok(delta_total)) = (
-                            row.get::<_, i64>(0),
-                            row.get::<_, Option<i64>>(1),
-                            row.get::<_, Option<i64>>(2),
-                            row.get::<_, Option<i64>>(5)
-                        ) {
-                            if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
-                                let cache_read = row.get::<_, Option<i64>>(3).ok().flatten().map(|v| v as u64);
-                                let reasoning = row.get::<_, Option<i64>>(4).ok().flatten().map(|v| v as u64);
-                                map.insert(turn_no as u32, TokenStats {
-                                    input: input as u64,
-                                    output: output as u64,
-                                    cache_read,
-                                    cache_write: None,
-                                    reasoning,
-                                    total: total as u64,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        map
-    }).await.unwrap_or_default();
+
 
     let reader = BufReader::new(file);
     let mut timeline = Vec::new();
@@ -719,7 +693,13 @@ async fn get_session_details(Path(session_id): Path<String>) -> impl IntoRespons
     let mut total_cache = 0;
     let mut total_reasoning = 0;
     let mut total_all = 0;
-    let compaction_count = 0;
+    let mut compaction_count = 0;
+
+    let mut prev_cli_input = 0u64;
+    let mut prev_cli_cached = 0u64;
+    let mut prev_cli_output = 0u64;
+    let mut prev_cli_reasoning = 0u64;
+    let mut prev_cli_total = 0u64;
 
     let mut tool_calls_map: HashMap<String, usize> = HashMap::new();
     let mut seen_turn_ids: Vec<String> = Vec::new();
@@ -804,6 +784,14 @@ async fn get_session_details(Path(session_id): Path<String>) -> impl IntoRespons
                     }
                 }
             }
+            "compacted" => {
+                compaction_count += 1;
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp,
+                    status_type: "session_compaction".to_string(),
+                    message: "會話狀態壓縮完成 (Session Compaction Completed)".to_string(),
+                });
+            }
             "event_msg" => {
                 if let Some(p) = payload {
                     let sub_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -835,6 +823,59 @@ async fn get_session_details(Path(session_id): Path<String>) -> impl IntoRespons
                                 status_type: "thread_rolled_back".to_string(),
                                 message: "會話回滾 (Thread Rolled Back)".to_string(),
                             });
+                        }
+                        "token_count" => {
+                            if let Some(info) = p.get("info") {
+                                if let Some(usage_val) = info.get("total_token_usage") {
+                                    if let Ok(usage) = serde_json::from_value::<TokenCountUsage>(usage_val.clone()) {
+                                        // 計算 CLI token counts
+                                        let cli_input = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
+                                        let cli_cached = usage.cached_input_tokens;
+                                        let cli_output = usage.output_tokens;
+                                        let cli_reasoning = usage.reasoning_output_tokens;
+                                        let cli_total = cli_input + cli_output;
+
+                                        let delta_input = cli_input.saturating_sub(prev_cli_input);
+                                        let delta_cached = cli_cached.saturating_sub(prev_cli_cached);
+                                        let delta_output = cli_output.saturating_sub(prev_cli_output);
+                                        let delta_reasoning = cli_reasoning.saturating_sub(prev_cli_reasoning);
+                                        let delta_total = cli_total.saturating_sub(prev_cli_total);
+
+                                        // 更新前一回合狀態
+                                        prev_cli_input = cli_input;
+                                        prev_cli_cached = cli_cached;
+                                        prev_cli_output = cli_output;
+                                        prev_cli_reasoning = cli_reasoning;
+                                        prev_cli_total = cli_total;
+
+                                        // 更新 session 總計
+                                        total_in += delta_input;
+                                        total_out += delta_output;
+                                        total_cache += delta_cached;
+                                        total_reasoning += delta_reasoning;
+                                        total_all += delta_total;
+
+                                        // 尋找最後一個 AssistantReply 進行累加
+                                        for item in timeline.iter_mut().rev() {
+                                            if let TimelineItem::AssistantReply {
+                                                input_tokens,
+                                                output_tokens,
+                                                cache_read_tokens,
+                                                reasoning_tokens,
+                                                total_tokens,
+                                                ..
+                                            } = item {
+                                                *input_tokens = Some(input_tokens.unwrap_or(0) + delta_input);
+                                                *output_tokens = Some(output_tokens.unwrap_or(0) + delta_output);
+                                                *cache_read_tokens = Some(cache_read_tokens.unwrap_or(0) + delta_cached);
+                                                *reasoning_tokens = Some(reasoning_tokens.unwrap_or(0) + delta_reasoning);
+                                                *total_tokens = Some(total_tokens.unwrap_or(0) + delta_total);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -878,37 +919,16 @@ async fn get_session_details(Path(session_id): Path<String>) -> impl IntoRespons
                             current_model = m.to_string();
                         }
 
-                        // 從 DB 讀取補齊
-                        let mut input_tokens = None;
-                        let mut output_tokens = None;
-                        let mut cache_read_tokens = None;
-                        let mut reasoning_tokens = None;
-                        let mut total_tokens = None;
-
-                        if let Some(db_stats) = db_entries.get(&turn_no) {
-                            input_tokens = Some(db_stats.input);
-                            output_tokens = Some(db_stats.output);
-                            cache_read_tokens = db_stats.cache_read;
-                            reasoning_tokens = db_stats.reasoning;
-                            total_tokens = Some(db_stats.total);
-
-                            total_in += db_stats.input;
-                            total_out += db_stats.output;
-                            total_cache += db_stats.cache_read.unwrap_or(0);
-                            total_reasoning += db_stats.reasoning.unwrap_or(0);
-                            total_all += db_stats.total;
-                        }
-
                         timeline.push(TimelineItem::AssistantReply {
                             timestamp,
                             reply,
                             model: current_model.clone(),
-                            output_tokens,
-                            input_tokens,
-                            cache_read_tokens,
+                            output_tokens: None,
+                            input_tokens: None,
+                            cache_read_tokens: None,
                             cache_write_tokens: None,
-                            reasoning_tokens,
-                            total_tokens,
+                            reasoning_tokens: None,
+                            total_tokens: None,
                             tool_requests: Vec::new(),
                             turn_no,
                         });

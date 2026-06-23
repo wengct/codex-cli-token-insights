@@ -37,7 +37,7 @@
 
 本專案完全運行於您的本地端，確保所有數據的隱私與安全性。
 
-### 一、啟動看板服務
+### 一、啟動看板服務 (開發與測試)
 
 切換至專案根目錄，執行以下命令：
 
@@ -52,6 +52,76 @@ cargo run
 🚀 Codex CLI Token Insights Dashboard is running on: http://localhost:3001
 ```
 請在瀏覽器中打開 [**`http://localhost:3001`**](http://localhost:3001)，即可開始使用您的看板！
+
+### 二、設定為常駐背景服務 (systemd)
+
+如果您希望將看板作為本地常駐服務運作（免去每次手動開啟終端機執行 `cargo run`），推薦使用 Linux 原生的 `systemd` 使用者級別服務：
+
+#### 1️⃣ 編譯發行版本 (Release Build)
+為求最佳效能與資源使用效率，請先編譯獨立的 Release 二進位檔：
+```bash
+cargo build --release
+```
+
+#### 2️⃣ 配置 systemd 服務
+本專案已為您準備好服務描述檔範本，您只需執行以下指令即可將其複製並註冊至系統中：
+```bash
+# 建立 systemd 使用者配置目錄
+mkdir -p ~/.config/systemd/user/
+
+# 替換範本中的專案路徑並複製到 systemd 目錄中
+sed "s|<PROJECT_DIR>|$PWD|g" shell/codex-insights.service > ~/.config/systemd/user/codex-insights.service
+
+# 重新載入設定
+systemctl --user daemon-reload
+```
+
+#### 3️⃣ 啟動與管理服務
+```bash
+# 啟動服務
+systemctl --user start codex-insights.service
+
+# 設定開機自動啟動
+systemctl --user enable codex-insights.service
+```
+
+> [!TIP]
+> **常駐背景執行提示 (Linger)**：
+> 使用者級別服務預設會在您登出 SSH/終端機時停止。若要讓服務在背景永久常駐，請在您的主機上執行以下指令來啟用 `linger`：
+> ```bash
+> sudo loginctl enable-linger $USER
+> ```
+
+#### 4️⃣ 常用管理命令
+* **查看服務狀態**：`systemctl --user status codex-insights.service`
+* **查看即時日誌**：`journalctl --user -u codex-insights.service -n 50 -f`
+* **重啟服務**：`systemctl --user restart codex-insights.service`
+* **停止服務**：`systemctl --user stop codex-insights.service`
+```
+
+---
+
+### 三、其他常駐部署替代方案
+
+#### 💡 替代方案一：使用 PM2 管理
+如果您習慣使用 PM2（適用於已安裝 Node.js 的環境），也可以透過 PM2 來啟動並管理此服務：
+```bash
+# 編譯二進位檔案
+cargo build --release
+
+# 啟動服務並為其命名
+pm2 start ./target/release/codex-cli-token-insights --name "codex-token-insights"
+
+# 設定開機自啟
+pm2 save
+pm2 startup
+```
+
+#### 💡 替代方案二：簡單的背景執行 (nohup)
+如果不想進行任何系統層級的設定，只想快速在背景執行：
+```bash
+nohup ./target/release/codex-cli-token-insights > codex-insights.log 2>&1 &
+```
 
 ---
 
