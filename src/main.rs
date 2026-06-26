@@ -159,6 +159,9 @@ struct UsageEntry {
     delta_tokens: Option<TokenStats>,
     context: Option<ContextStats>,
     cost: Option<CostStats>,
+    parent_session_id: Option<String>,
+    agent_nickname: Option<String>,
+    agent_role: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -373,6 +376,9 @@ struct SessionSummary {
     timestamp: String,
     duration_ms: u64,
     cost_usd: f64,
+    parent_session_id: Option<String>,
+    agent_nickname: Option<String>,
+    agent_role: Option<String>,
 }
 
 async fn get_usage_details(Path(date): Path<String>) -> impl IntoResponse {
@@ -390,7 +396,7 @@ async fn get_usage_details(Path(date): Path<String>) -> impl IntoResponse {
                 timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                 tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
                 delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
-                duration_ms, premium_requests
+                duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role
              FROM usage_entries WHERE date = ? ORDER BY timestamp ASC"
         ).map_err(|e| e.to_string())?;
 
@@ -446,6 +452,10 @@ async fn get_usage_details(Path(date): Path<String>) -> impl IntoResponse {
                 None
             };
 
+            let parent_session_id: Option<String> = row.get(21).ok();
+            let agent_nickname: Option<String> = row.get(22).ok();
+            let agent_role: Option<String> = row.get(23).ok();
+
             Ok(UsageEntry {
                 timestamp: row.get(0)?,
                 session_id: row.get(1)?,
@@ -460,6 +470,9 @@ async fn get_usage_details(Path(date): Path<String>) -> impl IntoResponse {
                 delta_tokens,
                 context: None,
                 cost,
+                parent_session_id,
+                agent_nickname,
+                agent_role,
             })
         }).map_err(|e| e.to_string())?;
 
@@ -576,6 +589,10 @@ async fn get_usage_details(Path(date): Path<String>) -> impl IntoResponse {
         );
         summary.total_cost_usd += cost_usd;
 
+        let parent_session_id = s_entries.iter().find_map(|e| e.parent_session_id.clone());
+        let agent_nickname = s_entries.iter().find_map(|e| e.agent_nickname.clone());
+        let agent_role = s_entries.iter().find_map(|e| e.agent_role.clone());
+
         sessions_summary.push(SessionSummary {
             session_id,
             session_name: last_entry.session_name.unwrap_or_else(|| "Start Coding Session".to_string()),
@@ -590,6 +607,9 @@ async fn get_usage_details(Path(date): Path<String>) -> impl IntoResponse {
             timestamp: s_entries[0].timestamp.clone(),
             duration_ms: session_duration,
             cost_usd,
+            parent_session_id,
+            agent_nickname,
+            agent_role,
         });
     }
 
@@ -768,6 +788,26 @@ async fn get_session_details(Path(session_id): Path<String>) -> impl IntoRespons
                         if let Some(repo) = git.get("repository_url") {
                             metadata.insert("repository".to_string(), repo.clone());
                         }
+                    }
+                    if let Some(nickname) = p.get("agent_nickname").and_then(|v| v.as_str()).map(|s| s.to_string()).or_else(|| {
+                        p.get("source")
+                            .and_then(|s| s.get("subagent"))
+                            .and_then(|s| s.get("thread_spawn"))
+                            .and_then(|t| t.get("agent_nickname"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    }) {
+                        metadata.insert("agent_nickname".to_string(), serde_json::Value::String(nickname));
+                    }
+                    if let Some(role) = p.get("agent_role").and_then(|v| v.as_str()).map(|s| s.to_string()).or_else(|| {
+                        p.get("source")
+                            .and_then(|s| s.get("subagent"))
+                            .and_then(|s| s.get("thread_spawn"))
+                            .and_then(|t| t.get("agent_role"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    }) {
+                        metadata.insert("agent_role".to_string(), serde_json::Value::String(role));
                     }
                 }
                 timeline.push(TimelineItem::SystemStatus {
@@ -1087,7 +1127,7 @@ async fn get_monthly_details(Path(year_month): Path<String>) -> impl IntoRespons
                 timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                 tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
                 delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
-                duration_ms, premium_requests
+                duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role
              FROM usage_entries WHERE date LIKE ? ORDER BY timestamp ASC"
         ).map_err(|e| e.to_string())?;
 
@@ -1143,6 +1183,10 @@ async fn get_monthly_details(Path(year_month): Path<String>) -> impl IntoRespons
                 None
             };
 
+            let parent_session_id: Option<String> = row.get(21).ok();
+            let agent_nickname: Option<String> = row.get(22).ok();
+            let agent_role: Option<String> = row.get(23).ok();
+
             Ok(UsageEntry {
                 timestamp: row.get(0)?,
                 session_id: row.get(1)?,
@@ -1157,6 +1201,9 @@ async fn get_monthly_details(Path(year_month): Path<String>) -> impl IntoRespons
                 delta_tokens,
                 context: None,
                 cost,
+                parent_session_id,
+                agent_nickname,
+                agent_role,
             })
         }).map_err(|e| e.to_string())?;
 

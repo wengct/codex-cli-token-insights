@@ -964,7 +964,19 @@ function renderChart(sessions) {
           const index = elements[0].index;
           const session = currentChartSessions[index];
           if (session) {
-            openSessionTimeline(session.session_id, session.session_name, session.total_tokens, session.total_cache_read_tokens);
+            openSessionTimeline(
+              session.session_id,
+              session.session_name,
+              session.total_tokens,
+              session.total_cache_read_tokens,
+              session.total_input_tokens,
+              session.total_output_tokens,
+              session.total_reasoning_tokens,
+              session.cwd,
+              session.model,
+              session.agent_nickname,
+              session.agent_role
+            );
           }
         }
       },
@@ -1097,32 +1109,71 @@ function initTableSorting() {
   });
 }
 
+// =========================================================================
+// 樹狀化與扁平化 Session，以在排序時依然維持 Subagent 階層關係
+// =========================================================================
+function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
+  const map = {};
+  sessions.forEach(s => {
+    map[s.session_id] = { ...s, children: [] };
+  });
+
+  const roots = [];
+  sessions.forEach(s => {
+    const item = map[s.session_id];
+    if (s.parent_session_id && map[s.parent_session_id]) {
+      map[s.parent_session_id].children.push(item);
+    } else {
+      roots.push(item);
+    }
+  });
+
+  const compare = (a, b) => {
+    let valA = a[sortCol];
+    let valB = b[sortCol];
+    if (valA === undefined || valA === null) valA = 0;
+    if (valB === undefined || valB === null) valB = 0;
+
+    if (typeof valA === 'string' && typeof valB === 'string') {
+      return sortDir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+    }
+    return sortDir === 'asc' ? valA - valB : valB - valA;
+  };
+
+  // 排序 Root 節點
+  roots.sort(compare);
+
+  // 遞迴排序子節點
+  const sortTree = (node) => {
+    node.children.sort(compare);
+    node.children.forEach(sortTree);
+  };
+  roots.forEach(sortTree);
+
+  // 扁平化
+  const flat = [];
+  const traverse = (node, depth, parentName) => {
+    flat.push({
+      ...node,
+      depth,
+      isSubagent: depth > 0,
+      parentName
+    });
+    node.children.forEach(child => traverse(child, depth + 1, node.session_name));
+  };
+  roots.forEach(r => traverse(r, 0, null));
+
+  return flat;
+}
+
 function sortAndRenderSessionTable() {
   if (!currentSessions || currentSessions.length === 0) {
     renderSessionTable([]);
     return;
   }
 
-  currentSessions.sort((a, b) => {
-    let valA = a[currentSortColumn];
-    let valB = b[currentSortColumn];
-
-    // 空值處理
-    if (valA === undefined || valA === null) valA = 0;
-    if (valB === undefined || valB === null) valB = 0;
-
-    // 字串欄位使用 localeCompare 來支援中英文混合排序
-    if (typeof valA === 'string' && typeof valB === 'string') {
-      return currentSortDirection === 'asc' 
-        ? valA.localeCompare(valB) 
-        : valB.localeCompare(valA);
-    }
-
-    // 數值比較
-    return currentSortDirection === 'asc' ? valA - valB : valB - valA;
-  });
-
-  renderSessionTable(currentSessions);
+  const flatSessions = sortAndGetFlatSessions(currentSessions, currentSortColumn, currentSortDirection);
+  renderSessionTable(flatSessions);
   updateSortHeadersUI();
 }
 
@@ -1162,16 +1213,64 @@ function renderSessionTable(sessions) {
     return;
   }
 
+  // 建立快速查詢 Map
+  const sessionsMap = {};
+  sessions.forEach(s => {
+    sessionsMap[s.session_id] = s;
+  });
+
+  // 尋找最終 Root 父會話 ID 的 helper
+  function getRootParentId(session) {
+    let curr = session;
+    while (curr && curr.parent_session_id && sessionsMap[curr.parent_session_id]) {
+      curr = sessionsMap[curr.parent_session_id];
+    }
+    return curr ? curr.session_id : session.session_id;
+  }
+
   sessions.forEach(s => {
     const tr = document.createElement('tr');
+    tr.setAttribute('data-session-id', s.session_id);
+    tr.setAttribute('data-parent-id', s.parent_session_id || '');
+
+    if (s.isSubagent) {
+      tr.classList.add('subagent-row');
+    }
     
     // 格式化時間
     const timeFormatted = s.timestamp ? formatLocalTime(s.timestamp, true) : '-';
 
+    // 依據 depth 縮排會話名稱，並呈現└─ 符號與 subagent tag
+    let nameCellContent = '';
+    if (s.isSubagent) {
+      const paddingLeft = s.depth * 16;
+      const connectorLeft = (s.depth - 1) * 16 + 4;
+      const nickname = s.agent_nickname || '';
+      const role = s.agent_role || '';
+      nameCellContent = `
+        <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
+          <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
+          <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
+            <span class="badge subagent-badge" title="Subagent of: ${escapeHtml(s.parentName || '')}">Subagent</span>
+            ${nickname ? `<span class="badge agent-nickname-badge" title="Agent Nickname: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
+            ${role ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(role)}">${escapeHtml(role)}</span>` : ''}
+          </div>
+          <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
+          <span class="session-id-sub">${s.session_id}</span>
+        </div>
+      `;
+    } else {
+      nameCellContent = `
+        <div class="session-name-wrapper">
+          <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
+          <span class="session-id-sub">${s.session_id}</span>
+        </div>
+      `;
+    }
+
     tr.innerHTML = `
-      <td class="session-name-cell" title="${escapeHtml(s.session_name)}">
-        ${escapeHtml(s.session_name)}
-        <span class="session-id-sub">${s.session_id}</span>
+      <td class="session-name-cell">
+        ${nameCellContent}
       </td>
       <td><span class="badge highlight">${escapeHtml(s.model)}</span></td>
       <td><span class="badge">${s.max_turn_no}</span></td>
@@ -1187,7 +1286,39 @@ function renderSessionTable(sessions) {
 
     // 當點擊 Session 時，開啟對話詳細還原
     tr.addEventListener('click', () => {
-      openSessionTimeline(s.session_id, s.session_name, s.total_tokens, s.total_cache_read_tokens, s.total_input_tokens, s.total_output_tokens, s.total_reasoning_tokens, s.cwd, s.model);
+      openSessionTimeline(
+        s.session_id,
+        s.session_name,
+        s.total_tokens,
+        s.total_cache_read_tokens,
+        s.total_input_tokens,
+        s.total_output_tokens,
+        s.total_reasoning_tokens,
+        s.cwd,
+        s.model,
+        s.agent_nickname,
+        s.agent_role
+      );
+    });
+
+    // 群組 Hover 高亮
+    tr.addEventListener('mouseenter', () => {
+      const rootId = getRootParentId(s);
+      tbody.querySelectorAll('tr').forEach(row => {
+        const sid = row.getAttribute('data-session-id');
+        const pid = row.getAttribute('data-parent-id');
+        const rowSession = sessionsMap[sid];
+        
+        if (sid === rootId || pid === rootId || (rowSession && getRootParentId(rowSession) === rootId)) {
+          row.classList.add('family-highlight');
+        }
+      });
+    });
+
+    tr.addEventListener('mouseleave', () => {
+      tbody.querySelectorAll('tr').forEach(row => {
+        row.classList.remove('family-highlight');
+      });
     });
 
     tbody.appendChild(tr);
@@ -1197,7 +1328,7 @@ function renderSessionTable(sessions) {
 // =========================================================================
 // API 呼叫: 載入並渲染特定 Session 對話時間軸 (Timeline)
 // =========================================================================
-async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheReadTokens, inputTokens, outputTokens, reasoningTokens, cwd, model) {
+async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheReadTokens, inputTokens, outputTokens, reasoningTokens, cwd, model, agentNickname, agentRole) {
   const drawerOverlay = document.getElementById('timeline-drawer');
   const timelineContainer = document.getElementById('timeline-items');
 
@@ -1230,6 +1361,23 @@ async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheRea
   document.getElementById('meta-input').textContent = formatToken(inputTokens || 0);
   document.getElementById('meta-output').textContent = formatToken(outputTokens || 0);
   document.getElementById('meta-reasoning').textContent = formatToken(reasoningTokens || 0);
+
+  const nicknameContainer = document.getElementById('drawer-meta-nickname-container');
+  const roleContainer = document.getElementById('drawer-meta-role-container');
+
+  if (agentNickname) {
+    document.getElementById('meta-nickname').textContent = agentNickname;
+    nicknameContainer.style.display = 'flex';
+  } else {
+    nicknameContainer.style.display = 'none';
+  }
+
+  if (agentRole) {
+    document.getElementById('meta-role').textContent = agentRole;
+    roleContainer.style.display = 'flex';
+  } else {
+    roleContainer.style.display = 'none';
+  }
 
   // 顯示加載動畫
   timelineContainer.innerHTML = `<div class="placeholder-text">${t('drawer_loading')}</div>`;
@@ -1277,6 +1425,23 @@ function renderTimeline(data) {
   document.getElementById('meta-model').textContent = finalModel;
   document.getElementById('meta-repo').textContent = metadata.repository || '-';
   document.getElementById('meta-repo').title = metadata.repository || '';
+
+  const nicknameContainer = document.getElementById('drawer-meta-nickname-container');
+  const roleContainer = document.getElementById('drawer-meta-role-container');
+
+  if (metadata.agent_nickname) {
+    document.getElementById('meta-nickname').textContent = metadata.agent_nickname;
+    nicknameContainer.style.display = 'flex';
+  } else {
+    nicknameContainer.style.display = 'none';
+  }
+
+  if (metadata.agent_role) {
+    document.getElementById('meta-role').textContent = metadata.agent_role;
+    roleContainer.style.display = 'flex';
+  } else {
+    roleContainer.style.display = 'none';
+  }
 
   // 取得最終使用的 Token 數據（若單一 session events 日誌無 token stats，則使用列表正確累積數據）
   const finalTotal = metadata.total_tokens || currentSessionTotalTokens || 0;

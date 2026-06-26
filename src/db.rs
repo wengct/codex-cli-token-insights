@@ -63,10 +63,21 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             
             -- 成本與時間
             duration_ms INTEGER,
-            premium_requests INTEGER
+            premium_requests INTEGER,
+            parent_session_id TEXT,
+            agent_nickname TEXT,
+            agent_role TEXT
         )",
         [],
     ).map_err(|e| format!("建立 usage_entries 表失敗: {}", e))?;
+
+    // Attempt to add parent_session_id column if database already exists
+    let _ = conn.execute("ALTER TABLE usage_entries ADD COLUMN parent_session_id TEXT", []);
+    if conn.execute("ALTER TABLE usage_entries ADD COLUMN agent_nickname TEXT", []).is_ok() {
+        // If we successfully added the column, clear sync_state to force a full re-sync
+        let _ = conn.execute("DELETE FROM sync_state", []);
+    }
+    let _ = conn.execute("ALTER TABLE usage_entries ADD COLUMN agent_role TEXT", []);
 
     // 建立唯一聯合約束，防止重複寫入
     conn.execute(
@@ -146,6 +157,9 @@ fn parse_session_file(
 
     let mut cli_version = None;
     let mut session_meta_cwd = None;
+    let mut parent_session_id = None;
+    let mut agent_nickname = None;
+    let mut agent_role = None;
 
     let mut seen_turn_ids = Vec::new();
     let mut active_turn_id: Option<String> = None;
@@ -172,6 +186,39 @@ fn parse_session_file(
                 }
                 if session_meta_cwd.is_none() {
                     session_meta_cwd = p.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
+                }
+                let p_sid = p.get("session_id").and_then(|v| v.as_str());
+                let p_id = p.get("id").and_then(|v| v.as_str());
+                if let (Some(psid), Some(pid)) = (p_sid, p_id) {
+                    if psid != pid {
+                        parent_session_id = Some(psid.to_string());
+                    }
+                }
+                if agent_nickname.is_none() {
+                    agent_nickname = p.get("agent_nickname")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            p.get("source")
+                                .and_then(|s| s.get("subagent"))
+                                .and_then(|s| s.get("thread_spawn"))
+                                .and_then(|t| t.get("agent_nickname"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        });
+                }
+                if agent_role.is_none() {
+                    agent_role = p.get("agent_role")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            p.get("source")
+                                .and_then(|s| s.get("subagent"))
+                                .and_then(|s| s.get("thread_spawn"))
+                                .and_then(|t| t.get("agent_role"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        });
                 }
             }
             continue;
@@ -334,6 +381,9 @@ fn parse_session_file(
                 delta_tokens: Some(turn_delta),
                 context: None,
                 cost,
+                parent_session_id: parent_session_id.clone(),
+                agent_nickname: agent_nickname.clone(),
+                agent_role: agent_role.clone(),
             });
         }
     }
@@ -413,8 +463,8 @@ pub fn sync_usage_logs(conn: &Connection) -> Result<(), String> {
                         timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                         tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
                         delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
-                        duration_ms, premium_requests
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         entry.timestamp,
                         session_date,
@@ -437,7 +487,10 @@ pub fn sync_usage_logs(conn: &Connection) -> Result<(), String> {
                         delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
-                        cost.and_then(|c| c.total_premium_requests.map(|r| r as i64))
+                        cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
+                        entry.parent_session_id.as_deref(),
+                        entry.agent_nickname.as_deref(),
+                        entry.agent_role.as_deref()
                     ],
                 );
 
